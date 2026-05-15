@@ -40,3 +40,7 @@ Raspberry Pi OS Bookworm 6.12.75, Debian 13, Ubuntu 22.04 / 24.04 / 26.04, Arch,
 sudo install -m 4755 vuln_target /usr/local/bin/vuln_target
 ./exploit_vuln_target /usr/local/bin/vuln_target
 ```
+
+```
+https://nvd.nist.gov/vuln/detail/CVE-2026-46333
+```
